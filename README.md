@@ -6,7 +6,11 @@ Aidan Aalund, Nora Fischer, Michael Chung
 
 -----
 
-## Repo Structure
+## Repository Structure
+
+### Machine Learning Models and Dataset Exploration (/ml)
+
+Python Notebooks utilizing the IAM-OnDB dataset to train the character recognition and phenotyping models can be found here.
 
 ### Software (/sw)
 
