@@ -1,1 +1,5 @@
 ml/datasets
+
+# Python Ignores
+*.cpython
+sw/src/__pycache__

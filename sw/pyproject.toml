@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools >= 77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "smart-whiteboard-app"
+version = "0.1.0"
+dependencies = [
+    "numpy",
+    "torch",
+    "opencv-python",
+    "scikit-learn",
+    "customtkinter",
+    "pygrabber",
+    "pillow",
+    "onnx",
+    "onnxruntime",
+    "bleak"
+]
+requires-python = ">=3.12"
+authors = [
+  {name = "Aidan Aalund"},
+  {name = "Micheal Chung"},
+  {name = "Nora Fischer"},
+]
+maintainers = [
+  {name = "Aidan Aalund", email = "aidan.aalund@utexas.edu"}
+]
+readme = "README.md"
