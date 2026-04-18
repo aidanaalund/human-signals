@@ -3,20 +3,22 @@ import threading
 import asyncio
 import multiprocessing # Put inference on GPU or separate core
 import serial
+from pathlib import Path
 
 import numpy as np # ML stuff
 import torch
 from torch.utils.data import Dataset, DataLoader
 import sklearn as sk
 from sklearn import metrics
-import cv2 # Kalman filter possibly?
 
-from pygrabber.dshow_graph import FilterGraph # Webcam stuff
-import PIL.Image, PIL.ImageTk
+import bleak
 
 import customtkinter # Desktop app stuff
 import tkinter as tk
-from pathlib import Path
+import mediapipe as mp
+import cv2 # Kalman filter possibly?
+from cv2_enumerate_cameras import enumerate_cameras
+import PIL.Image, PIL.ImageTk
 
 from writer_id_torch import WriterRegistry, load_model_bundle
 from writer_id_onnx import ONNXWriterRegistry
@@ -101,7 +103,7 @@ class MyVideoCapture:
 
     def get_frame(self):
         if not self.vid.isOpened():
-            return (return_value, None)
+            return (False, None)
 
         return_value, frame = self.vid.read()
         if return_value:
@@ -147,7 +149,7 @@ class App(customtkinter.CTk):
         self.pending_enroll_writer = None
 
         # Configure window
-        self.title("Sketch Board App")
+        self.title("Whiteboard Digitizer")
 
         # Make the window fullscreen
         self.after(0, lambda: self.wm_state('zoomed'))
@@ -171,10 +173,10 @@ class App(customtkinter.CTk):
         self.controls_label.pack(pady=(10, 20))
 
         #get the available video devices
-        self.graph = FilterGraph()
+        self.camera_list = enumerate_cameras()
 
         # fill combobox with availible video devices
-        self.combobox = customtkinter.CTkOptionMenu(self.controls_frame, values=self.graph.get_input_devices())
+        self.combobox = customtkinter.CTkOptionMenu(self.controls_frame, values=[c.name for c in self.camera_list])
         self.combobox.pack(pady=10, padx=20, fill="x")
 
         # Recording button
@@ -230,9 +232,12 @@ class App(customtkinter.CTk):
     def sidebar_button_event(self):
         print("try to open camera: " + self.combobox.get())   
 
-        for i, device in enumerate(self.graph.get_input_devices() ):   
-            if device == self.combobox.get():
+        selected_name = self.combobox.get()
+        self.video_source = 0  # default fallback
+        for i, device in enumerate(self.camera_list):   
+            if device.name == selected_name:
                 self.video_source = i
+                break
 
         # main window
         self.vid = MyVideoCapture(self.video_source)

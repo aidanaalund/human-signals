@@ -10,10 +10,12 @@ dependencies = [
     "pandas",
     "torch",
     "opencv-python",
+    "cv2_enumerate_cameras",
     "scikit-learn",
     "customtkinter",
     "pygrabber",
     "pillow",
+    "mediapipe",
     "onnx",
     "onnxruntime",
     "bleak"
