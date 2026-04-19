@@ -1,0 +1,1 @@
+timestamp,session,label,speed,prompt_index,file_path,num_samples,start_count,end_count,drops_during_capture,measured_rate_hz

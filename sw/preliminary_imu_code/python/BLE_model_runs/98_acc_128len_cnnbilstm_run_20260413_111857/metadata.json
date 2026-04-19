@@ -1,0 +1,5 @@
+{
+  "test_accuracy": 0.9767025113105774,
+  "target_len": 128,
+  "num_classes": 62
+}
