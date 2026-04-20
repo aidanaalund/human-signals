@@ -18,7 +18,8 @@ dependencies = [
     "mediapipe",
     "onnx",
     "onnxruntime",
-    "bleak"
+    "bleak",
+    "pyserial"
 ]
 requires-python = ">=3.12"
 authors = [
