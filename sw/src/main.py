@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
+import pandas as pd
+
 import bleak
 import cv2
 import customtkinter as ctk
@@ -28,6 +30,7 @@ from realtime_writer_id import Segmenter
 _HERE = Path(__file__).parent
 _ONNX_DIR = _HERE / "onnx"
 _ML_DIR = _HERE / "../../ml"
+_MEDIA_DIR = _HERE / "media"
 
 STYLE_ENCODER_PATH = _ONNX_DIR / "style_encoder.onnx"
 CHANNEL_MEAN_PATH  = _ML_DIR / "style_channel_mean.npy"
@@ -43,6 +46,7 @@ IMU_SERVICE_UUID = "19B10000-E8F2-537E-4F6C-D104768A1214"
 IMU_CHAR_UUID    = "19B10001-E8F2-537E-4F6C-D104768A1214"
 PACKET_FMT       = "<BBHIhhhhhh"
 PACKET_SIZE      = struct.calcsize(PACKET_FMT)  # 20 bytes
+SAMPLE_RATE      = 104
 
 # ---------------------------------------------------------------------------
 # Writer palette
@@ -106,7 +110,7 @@ class WriterIdentityEngine:
         onnx_path: Path = STYLE_ENCODER_PATH,
         channel_mean_path: Path = CHANNEL_MEAN_PATH,
         channel_std_path: Path = CHANNEL_STD_PATH,
-        unknown_threshold: float = 0.82,
+        unknown_threshold: float = 0.88,
         onnx_provider: str = "CPUExecutionProvider",
     ) -> None:
         self._onnx_path = onnx_path
@@ -120,14 +124,27 @@ class WriterIdentityEngine:
     def load(self) -> None:
         channel_mean = np.load(self._mean_path)
         channel_std  = np.load(self._std_path)
-        self.registry = ONNXWriterRegistry(
-            onnx_path=self._onnx_path,
-            channel_mean=channel_mean,
-            channel_std=channel_std,
-            target_len=96,
-            unknown_threshold=self._threshold,
-            providers=[self._provider],
-        )
+        providers = [self._provider]
+        try:
+            self.registry = ONNXWriterRegistry(
+                onnx_path=self._onnx_path,
+                channel_mean=channel_mean,
+                channel_std=channel_std,
+                target_len=96,
+                unknown_threshold=self._threshold,
+                providers=providers,
+            )
+        except Exception:
+            # CUDA/cuDNN unavailable or misconfigured — fall back silently to CPU
+            self._provider = "CPUExecutionProvider"
+            self.registry = ONNXWriterRegistry(
+                onnx_path=self._onnx_path,
+                channel_mean=channel_mean,
+                channel_std=channel_std,
+                target_len=96,
+                unknown_threshold=self._threshold,
+                providers=["CPUExecutionProvider"],
+            )
         self._loaded = True
 
     def set_provider(self, provider: str) -> None:
@@ -141,10 +158,10 @@ class WriterIdentityEngine:
             self.load()
         return self.registry.predict_or_unknown(segment)
 
-    def enroll_segment(self, writer_id: str, segment: np.ndarray) -> None:
+    def enroll_segment(self, writer_id: str, segment: np.ndarray, momentum: float = 0.95) -> None:
         if not self._loaded:
             self.load()
-        self.registry.update_writer(writer_id=writer_id, segment=segment)
+        self.registry.update_writer(writer_id=writer_id, segment=segment, momentum=momentum)
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +169,8 @@ class WriterIdentityEngine:
 # ---------------------------------------------------------------------------
 class MyVideoCapture:
     def __init__(self, video_source: int = 0) -> None:
-        self.vid = cv2.VideoCapture(video_source)
+        # DirectShow avoids the MSMF/CUDA conflict on Windows
+        self.vid = cv2.VideoCapture(video_source, cv2.CAP_DSHOW)
         self.vid.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
         self.vid.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
         if not self.vid.isOpened():
@@ -171,6 +189,95 @@ class MyVideoCapture:
     def __del__(self) -> None:
         if self.vid.isOpened():
             self.vid.release()
+
+
+# ---------------------------------------------------------------------------
+# FileVideoCapture  (drop-in for MyVideoCapture, reads from a file at real-time pace)
+# ---------------------------------------------------------------------------
+class FileVideoCapture:
+    def __init__(self, path: str) -> None:
+        self.vid = cv2.VideoCapture(str(path))
+        if not self.vid.isOpened():
+            raise ValueError("Cannot open video file", path)
+        self.width  = int(self.vid.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.height = int(self.vid.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = self.vid.get(cv2.CAP_PROP_FPS) or 30.0
+        self._frame_interval = 1.0 / fps
+        self._next_frame_time = time.monotonic()
+        self._exhausted = False
+
+    def get_frame(self) -> Tuple[bool, Optional[np.ndarray]]:
+        if self._exhausted:
+            time.sleep(self._frame_interval)  # prevent tight spin after EOF
+            return False, None
+        now = time.monotonic()
+        wait = self._next_frame_time - now
+        if wait > 0:
+            time.sleep(wait)
+        ok, frame = self.vid.read()
+        self._next_frame_time = time.monotonic() + self._frame_interval
+        if ok:
+            return True, cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        self._exhausted = True
+        return False, None
+
+    def __del__(self) -> None:
+        if self.vid.isOpened():
+            self.vid.release()
+
+
+# ---------------------------------------------------------------------------
+# CSVIMUPlayer  (drop-in for BLE notifications, replays a CSV into _imu_queue)
+# ---------------------------------------------------------------------------
+class CSVIMUPlayer:
+    TARGET_HZ = 75.0
+    _CHANNELS = ["ax_g", "ay_g", "az_g", "gx_dps", "gy_dps", "gz_dps"]
+
+    def __init__(self, csv_path: str, imu_queue: "queue.Queue[np.ndarray]") -> None:
+        self._path      = Path(csv_path)
+        self._queue     = imu_queue
+        self._running   = False
+        self._thread: Optional[threading.Thread] = None
+        # Extract writer label from filename: recording1_X_... → "X"
+        parts = self._path.stem.split("_")
+        self._label: Optional[str] = parts[1] if len(parts) > 1 else None
+
+    @property
+    def writer_label(self) -> Optional[str]:
+        return self._label
+
+    def start(self) -> None:
+        self._running = True
+        self._thread = threading.Thread(target=self._run, daemon=True, name="imu-player")
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._running = False
+
+    def _load_and_resample(self) -> Tuple[np.ndarray, np.ndarray]:
+        df = pd.read_csv(self._path, skiprows=2)
+        df.columns = df.columns.str.strip()
+        t_src = df["t_rel_host_s"].values.astype(np.float64)
+        t_new = np.arange(0.0, t_src[-1], 1.0 / self.TARGET_HZ)
+        resampled = np.empty((len(t_new), 6), dtype=np.float32)
+        for i, ch in enumerate(self._CHANNELS):
+            resampled[:, i] = np.interp(t_new, t_src, df[ch].values).astype(np.float32)
+        return t_new, resampled
+
+    def _run(self) -> None:
+        t_grid, samples = self._load_and_resample()
+        t0 = time.monotonic()
+        for t_target, sample in zip(t_grid, samples):
+            if not self._running:
+                break
+            deadline = t0 + float(t_target)
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(remaining)
+            try:
+                self._queue.put_nowait(sample)
+            except queue.Full:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -194,8 +301,10 @@ class BLEManager:
     def scan(self, timeout: float = 5.0):
         return asyncio.run_coroutine_threadsafe(self._scan_async(timeout), self._loop)
 
-    def connect(self, device: bleak.BLEDevice):
-        return asyncio.run_coroutine_threadsafe(self._connect_async(device), self._loop)
+    def connect(self, device: bleak.BLEDevice, on_disconnect: Optional[Callable] = None):
+        return asyncio.run_coroutine_threadsafe(
+            self._connect_async(device, on_disconnect=on_disconnect), self._loop
+        )
 
     def disconnect(self):
         return asyncio.run_coroutine_threadsafe(self._disconnect_async(), self._loop)
@@ -209,19 +318,61 @@ class BLEManager:
     # --- async internals ---
 
     async def _scan_async(self, timeout: float) -> List[bleak.BLEDevice]:
-        devices = await bleak.BleakScanner.discover(timeout=timeout)
-        return [d for d in devices if d.name]
+        # Filter by service UUID so we only surface the pen even if it hasn't
+        # broadcast a human-readable name yet.
+        seen: dict[str, bleak.BLEDevice] = {}
 
-    async def _connect_async(self, device: bleak.BLEDevice) -> bool:
-        try:
-            self._client = bleak.BleakClient(device)
-            await self._client.connect()
-            await self._client.start_notify(IMU_CHAR_UUID, self._notification_handler)
-            self._connected.set()
-            return True
-        except Exception:
-            self._connected.clear()
-            return False
+        def _cb(device: bleak.BLEDevice, _adv) -> None:
+            seen[device.address] = device
+
+        async with bleak.BleakScanner(
+            detection_callback=_cb,
+            service_uuids=[IMU_SERVICE_UUID],
+        ):
+            await asyncio.sleep(timeout)
+
+        # Fall back to a name-based sweep if the UUID filter found nothing
+        # (some Windows BLE stacks don't pass service UUIDs in advertisements).
+        if not seen:
+            all_devices = await bleak.BleakScanner.discover(timeout=timeout)
+            for d in all_devices:
+                seen[d.address] = d
+
+        return list(seen.values())
+
+    async def _connect_async(
+        self,
+        device: bleak.BLEDevice,
+        on_disconnect: Optional[Callable] = None,
+        retries: int = 3,
+    ) -> bool:
+        for attempt in range(retries):
+            try:
+                self._client = bleak.BleakClient(
+                    device,
+                    disconnected_callback=lambda _: self._on_disconnect(on_disconnect),
+                )
+                await self._client.connect(timeout=10.0)
+
+                # stop_notify first in case the device still thinks it's subscribed
+                try:
+                    await self._client.stop_notify(IMU_CHAR_UUID)
+                except Exception:
+                    pass
+                await self._client.start_notify(IMU_CHAR_UUID, self._notification_handler)
+
+                self._connected.set()
+                return True
+            except Exception:
+                self._connected.clear()
+                if attempt < retries - 1:
+                    await asyncio.sleep(1.5)
+        return False
+
+    def _on_disconnect(self, on_disconnect_cb: Optional[Callable]) -> None:
+        self._connected.clear()
+        if on_disconnect_cb:
+            on_disconnect_cb()
 
     async def _disconnect_async(self) -> None:
         if self._client and self._client.is_connected:
@@ -333,25 +484,38 @@ class ROISelector:
 # CVWorker
 # ---------------------------------------------------------------------------
 class CVWorker:
-    FPS                  = 5
-    OBSTRUCTION_THRESH   = 45.0
-    CHANGE_THRESH        = 15.0
-    WARP_WIDTH           = 960
+    PROCESS_INTERVAL      = 0.2   # CV analysis at 5fps
+    WARP_WIDTH            = 1280  # wider warp → finer OCR resolution
+    STABILITY_FRAMES      = 4     # ticks of stability required to set initial reference
+    STABILITY_THRESH      = 8.0   # mean diff threshold — coarse motion gate
+    OCR_STABILITY_FRAMES  = 7     # ~1.4 s of quiet required before OCR fires
+    OCR_STABILITY_THRESH  = 5.0   # resets on person motion; ignores camera/sensor noise
+    CHANGE_COVERAGE_MIN   = 0.001 # <0.1% changed pixels → nothing new
+    DIFF_THRESH           = 30
+    PERSON_BLOB_FRAC      = 0.07  # single contour > 7% of image AND solid → person
+    OCR_MIN_INTERVAL      = 4.0   # minimum seconds between OCR triggers
 
     def __init__(
         self,
         vid: MyVideoCapture,
+        display_queue: "queue.Queue[np.ndarray]",
         result_queue: "queue.Queue[dict]",
     ) -> None:
-        self._vid = vid
-        self._q   = result_queue
-        self._lock = threading.Lock()
+        self._vid      = vid
+        self._disp_q   = display_queue
+        self._q        = result_queue
+        self._lock     = threading.Lock()
         self._corners: Optional[np.ndarray] = None
         self._M:   Optional[np.ndarray] = None
         self._warp_w = self.WARP_WIDTH
         self._warp_h = self.WARP_WIDTH
         self._reference: Optional[np.ndarray] = None
-        self._last_warped: Optional[np.ndarray] = None
+        self._ref_norm:  Optional[np.ndarray] = None
+        self._prev_norm: Optional[np.ndarray] = None
+        self._stable_count     = 0
+        self._ocr_stable_count = 0
+        self._last_process     = 0.0
+        self._last_change_post = 0.0
         self._running = False
         self._thread: Optional[threading.Thread] = None
 
@@ -359,8 +523,11 @@ class CVWorker:
         with self._lock:
             self._corners = corners
             self._M, self._warp_w, self._warp_h = self._compute_warp(corners)
-            self._reference = None
-            self._last_warped = None
+            self._reference       = None
+            self._ref_norm        = None
+            self._prev_norm       = None
+            self._stable_count    = 0
+            self._ocr_stable_count = 0
 
     def clear_roi(self) -> None:
         with self._lock:
@@ -397,23 +564,28 @@ class CVWorker:
         return M, out_w, out_h
 
     def _run(self) -> None:
-        interval = 1.0 / self.FPS
         while self._running:
-            t0 = time.monotonic()
-            ok, frame = self._vid.get_frame()
-            if ok and frame is not None:
-                self._process(frame)
-            elapsed = time.monotonic() - t0
-            rem = interval - elapsed
-            if rem > 0:
-                time.sleep(rem)
+            ok, frame = self._vid.get_frame()  # blocks at camera's native rate
+            if not ok or frame is None:
+                continue
 
-    def _process(self, frame: np.ndarray) -> None:
-        try:
-            self._q.put_nowait({"type": "frame", "raw": frame})
-        except queue.Full:
-            pass
+            # Always forward the latest frame for display; drop stale ones
+            try:
+                self._disp_q.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._disp_q.put_nowait(frame)
+            except queue.Full:
+                pass
 
+            # CV analysis at 5fps
+            now = time.monotonic()
+            if now - self._last_process >= self.PROCESS_INTERVAL:
+                self._last_process = now
+                self._process_cv(frame)
+
+    def _process_cv(self, frame: np.ndarray) -> None:
         with self._lock:
             M      = self._M
             warp_w = self._warp_w
@@ -422,69 +594,81 @@ class CVWorker:
         if M is None:
             return
 
-        warped = cv2.warpPerspective(frame, M, (warp_w, warp_h))
+        warped   = cv2.warpPerspective(frame, M, (warp_w, warp_h))
+        norm_new = self._normalize_illumination(warped)
 
-        if self._is_obstructed(warped):
-            return
+        if self._prev_norm is not None:
+            inter = float(cv2.absdiff(norm_new, self._prev_norm).mean())
+            self._stable_count     = self._stable_count     + 1 if inter < self.STABILITY_THRESH     else 0
+            self._ocr_stable_count = self._ocr_stable_count + 1 if inter < self.OCR_STABILITY_THRESH else 0
+        self._prev_norm = norm_new
 
+        # Phase 1 — no reference yet: require full stability window before setting it.
         if self._reference is None:
+            if self._stable_count < self.STABILITY_FRAMES:
+                return
             self._reference = warped.copy()
+            self._ref_norm  = norm_new.copy()
             return
 
-        if not self._has_changed(warped):
+        # Phase 2 — only fire OCR once the scene has been continuously quiet for
+        # OCR_STABILITY_FRAMES ticks (~2 s).  Any motion — person breathing,
+        # arm near the board, hair — resets this counter, so OCR only runs when
+        # nobody is close to the whiteboard and the text is fully drawn.
+        if self._ocr_stable_count < self.OCR_STABILITY_FRAMES:
             return
 
-        gray_new = cv2.cvtColor(warped,          cv2.COLOR_RGB2GRAY)
-        gray_ref = cv2.cvtColor(self._reference, cv2.COLOR_RGB2GRAY)
-        diff      = cv2.absdiff(gray_new, gray_ref)
-        mask      = (diff > 30).astype(np.uint8)
+        diff     = cv2.absdiff(norm_new, self._ref_norm)
+        mask     = (diff > self.DIFF_THRESH).astype(np.uint8)
+        coverage = float(mask.mean())
+
+        if coverage < self.CHANGE_COVERAGE_MIN:
+            return
+
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        is_text   = self._classify_change(contours, mask)
 
+        if self._has_person_blob(contours, mask):
+            return
+
+        # Rate-limit OCR triggers.  During cooldown, leave the reference unchanged
+        # so incremental changes accumulate and the next trigger sees the full diff.
+        now = time.monotonic()
+        if now - self._last_change_post < self.OCR_MIN_INTERVAL:
+            return
+
+        self._last_change_post = now
         self._reference = warped.copy()
+        self._ref_norm  = norm_new.copy()
 
         try:
             self._q.put_nowait({
                 "type":     "changed",
                 "warped":   warped,
-                "is_text":  is_text,
                 "contours": contours,
             })
         except queue.Full:
             pass
 
-    def _is_obstructed(self, warped: np.ndarray) -> bool:
-        if self._last_warped is None:
-            self._last_warped = warped.copy()
-            return False
-        diff = cv2.absdiff(warped, self._last_warped).mean()
-        self._last_warped = warped.copy()
-        return float(diff) > self.OBSTRUCTION_THRESH
-
-    def _has_changed(self, warped: np.ndarray) -> bool:
-        gray_new = cv2.cvtColor(warped,          cv2.COLOR_RGB2GRAY)
-        gray_ref = cv2.cvtColor(self._reference, cv2.COLOR_RGB2GRAY)
-        return float(cv2.absdiff(gray_new, gray_ref).mean()) > self.CHANGE_THRESH
-
-    @staticmethod
-    def _classify_change(
-        contours: tuple, mask: np.ndarray
-    ) -> bool:
-        total_area = mask.shape[0] * mask.shape[1]
-        text_like = 0
-        significant = 0
+    def _has_person_blob(self, contours: tuple, mask: np.ndarray) -> bool:
+        total = mask.shape[0] * mask.shape[1]
+        threshold = total * self.PERSON_BLOB_FRAC
         for c in contours:
             area = cv2.contourArea(c)
-            if area < 50:
+            if area < threshold:
                 continue
-            significant += 1
-            x, y, w, h = cv2.boundingRect(c)
-            aspect = w / max(h, 1)
-            if aspect > 2.0 and area < 0.05 * total_area:
-                text_like += 1
-        if significant == 0:
-            return False
-        return text_like / significant > 0.5
+            hull_area = cv2.contourArea(cv2.convexHull(c))
+            solidity  = area / (hull_area + 1e-6)
+            if solidity > 0.5:
+                return True
+        return False
+
+    @staticmethod
+    def _normalize_illumination(img_rgb: np.ndarray) -> np.ndarray:
+        gray  = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
+        k     = min(201, max(51, (img_rgb.shape[1] // 8) | 1))  # odd, ~1/8 width
+        illum = cv2.GaussianBlur(gray, (k, k), 0)
+        norm  = gray / (illum + 1.0) * 128.0
+        return np.clip(norm, 0, 255).astype(np.uint8)
 
 
 # ---------------------------------------------------------------------------
@@ -527,15 +711,25 @@ class PaddleOCRPipeline:
         if self._det_sess is None:
             self._load()
 
+    @staticmethod
+    def _enhance(img_rgb: np.ndarray) -> np.ndarray:
+        """CLAHE on the L channel to even out whiteboard illumination."""
+        lab = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        l = clahe.apply(l)
+        return cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2RGB)
+
     def run(self, img_rgb: np.ndarray) -> List[Dict]:
         self._ensure_loaded()
+        img_rgb = self._enhance(img_rgb)
         boxes = self._detect(img_rgb)
         if not boxes:
             return []
         texts = self._recognize(img_rgb, boxes)
         results = []
         for box, (text, conf) in zip(boxes, texts):
-            if text:
+            if text and conf >= 0.55:  # discard low-confidence hits (hair, glare, etc.)
                 results.append({"text": text, "conf": conf, "box": box})
         return results
 
@@ -551,15 +745,15 @@ class PaddleOCRPipeline:
         out_name = self._det_sess.get_outputs()[0].name
         prob_map = self._det_sess.run([out_name], {in_name: tensor})[0][0, 0]
 
-        binary  = (prob_map > 0.3).astype(np.uint8) * 255
+        binary  = (prob_map > 0.25).astype(np.uint8) * 255
         kernel  = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        dilated = cv2.dilate(binary, kernel, iterations=1)
+        dilated = cv2.dilate(binary, kernel, iterations=2)  # bridge thin-stroke gaps
         contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         scale_y = new_h / h
         boxes = []
         for c in contours:
-            if cv2.contourArea(c) < 100:
+            if cv2.contourArea(c) < 50:  # was 100; catches thin letters like l/i
                 continue
             rect  = cv2.minAreaRect(c)
             pts   = cv2.boxPoints(rect).astype(np.float32)
@@ -706,8 +900,11 @@ class DigitalWhiteboard:
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
-MIN_MOTION_VARIANCE = 0.05
-ATTRIBUTION_WINDOW  = 10.0
+MIN_MOTION_VARIANCE        = 0.05   # minimum variance to pass attribution
+PROTOTYPE_UPDATE_VARIANCE  = 0.10   # higher bar — only update model with clear writing
+ATTRIBUTION_WINDOW         = 10.0
+ENROLL_STROKES             = 5      # strokes collected silently before comparison starts
+BELOW_THRESH_STRIKES       = 3      # consecutive below-threshold strokes → new writer
 
 
 class App(ctk.CTk):
@@ -716,8 +913,9 @@ class App(ctk.CTk):
         self.title("Whiteboard Digitizer")
         self.after(0, lambda: self.wm_state("zoomed"))
 
-        self._imu_queue: queue.Queue = queue.Queue(maxsize=500)
-        self._cv_queue:  queue.Queue = queue.Queue(maxsize=20)
+        self._imu_queue:     queue.Queue = queue.Queue(maxsize=500)
+        self._display_queue: queue.Queue = queue.Queue(maxsize=2)
+        self._cv_queue:      queue.Queue = queue.Queue(maxsize=20)
 
         self._writer_engine = WriterIdentityEngine()
         self._ocr            = PaddleOCRPipeline()
@@ -730,6 +928,11 @@ class App(ctk.CTk):
         self._pending_enroll: Optional[str] = None
         self._last_writer: Optional[str] = None
         self._ble_devices: List[bleak.BLEDevice] = []
+        self._imu_player: Optional[CSVIMUPlayer] = None
+        self._pending_recording: Optional[Tuple[Path, Path]] = None
+        self._auto_writer_count = 0
+        self._below_thresh_count: int = 0
+        self._writer_stroke_counts: Dict[str, int] = {}
         self._bulletin_labels: List[ctk.CTkFrame] = []
 
         # camera list for selector
@@ -742,6 +945,7 @@ class App(ctk.CTk):
 
         self._imu_poll()
         self._cv_poll()
+        self._display_poll()
 
     # ------------------------------------------------------------------
     # UI construction
@@ -768,7 +972,10 @@ class App(ctk.CTk):
             ctrl, values=[c.name for c in self._camera_list] or ["No cameras found"]
         )
         self._cam_menu.pack(padx=12, pady=4, fill="x")
-        ctk.CTkButton(ctrl, text="Connect Camera", command=self._connect_camera).pack(padx=12, pady=4, fill="x")
+        self._cam_btn = ctk.CTkButton(ctrl, text="Connect Camera", command=self._connect_camera)
+        self._cam_btn.pack(padx=12, pady=4, fill="x")
+
+        ctk.CTkButton(ctrl, text="Load Recording", command=self._open_recording_picker).pack(padx=12, pady=4, fill="x")
 
         self._roi_btn = ctk.CTkButton(ctrl, text="Select ROI (4 clicks)", command=self._toggle_roi)
         self._roi_btn.pack(padx=12, pady=4, fill="x")
@@ -783,7 +990,9 @@ class App(ctk.CTk):
         ctk.CTkLabel(enroll, text="Writer ID", font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(8, 4))
         self._name_entry = ctk.CTkEntry(enroll, placeholder_text="Name")
         self._name_entry.pack(padx=12, pady=4, fill="x")
-        ctk.CTkButton(enroll, text="Enroll Next Stroke", command=self._arm_enrollment).pack(padx=12, pady=4, fill="x")
+        ctk.CTkButton(enroll, text="Enroll Next Stroke", command=self._arm_enrollment).pack(padx=12, pady=(4, 2), fill="x")
+        ctk.CTkButton(enroll, text="Rename Last Writer", command=self._rename_last_writer,
+                      fg_color="transparent", border_width=1).pack(padx=12, pady=(2, 4), fill="x")
         self._writer_label = ctk.CTkLabel(enroll, text="Writer: —")
         self._writer_label.pack(padx=12, pady=(0, 8))
 
@@ -793,6 +1002,7 @@ class App(ctk.CTk):
         ctk.CTkLabel(settings, text="Settings", font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(8, 4))
         self._gpu_var = ctk.BooleanVar(value=False)
         ctk.CTkCheckBox(settings, text="GPU Acceleration", variable=self._gpu_var, command=self._on_gpu_toggle).pack(padx=12, pady=(0, 8))
+
 
         # Bulletin
         bulletin_outer = ctk.CTkFrame(self._sidebar)
@@ -811,9 +1021,13 @@ class App(ctk.CTk):
         self._snapshot_canvas = tk.Canvas(self, bg="#222")
         self._snapshot_canvas.grid(row=1, column=1, padx=8, pady=8, sticky="nsew")
 
-        # ---- Digital twin label ----
-        self._twin_label = ctk.CTkLabel(self, text="No ROI selected", fg_color="#1a1a2e")
-        self._twin_label.grid(row=0, column=2, rowspan=2, padx=8, pady=8, sticky="nsew")
+        # ---- Digital twin (wrapper frame prevents image from expanding the column) ----
+        self._twin_frame = ctk.CTkFrame(self, fg_color="#1a1a2e", corner_radius=8)
+        self._twin_frame.grid(row=0, column=2, rowspan=2, padx=8, pady=8, sticky="nsew")
+        self._twin_frame.grid_propagate(False)
+        self._twin_label = ctk.CTkLabel(self._twin_frame, text="No ROI selected",
+                                        fg_color="transparent")
+        self._twin_label.place(relx=0.5, rely=0.5, anchor="center")
 
         # ---- ROI instruction label (hidden by default) ----
         self._roi_instruction = ctk.CTkLabel(
@@ -825,6 +1039,20 @@ class App(ctk.CTk):
     # Camera
     # ------------------------------------------------------------------
     def _connect_camera(self) -> None:
+        self._pending_recording   = None
+        self._auto_writer_count   = 0
+        self._below_thresh_count  = 0
+        self._last_writer         = None
+        self._writer_stroke_counts = {}
+        if self._writer_engine.registry:
+            self._writer_engine.registry.prototypes.clear()
+        if self._imu_player is not None:
+            self._imu_player.stop()
+            self._imu_player = None
+            self._ble_status.configure(text="Pen: disconnected", text_color="gray")
+        if self._cv_worker is not None:
+            self._cv_worker.stop()
+
         selected = self._cam_menu.get()
         src = 0
         for i, dev in enumerate(self._camera_list):
@@ -837,7 +1065,8 @@ class App(ctk.CTk):
             self._writer_label.configure(text=str(exc))
             return
 
-        self._cv_worker = CVWorker(self._vid, self._cv_queue)
+        self._cam_btn.configure(text="Connect Camera")
+        self._cv_worker = CVWorker(self._vid, self._display_queue, self._cv_queue)
         self._cv_worker.start()
 
     # ------------------------------------------------------------------
@@ -858,6 +1087,28 @@ class App(ctk.CTk):
     def _on_roi_selected(self, corners: np.ndarray) -> None:
         self._roi_btn.configure(text="Reset ROI")
         self._roi_instruction.place_forget()
+
+        if self._pending_recording is not None:
+            video_path, csv_path = self._pending_recording
+            self._pending_recording = None
+            try:
+                self._vid = FileVideoCapture(str(video_path))
+            except ValueError as exc:
+                self._writer_label.configure(text=str(exc))
+                return
+            self._cv_worker = CVWorker(self._vid, self._display_queue, self._cv_queue)
+            self._cv_worker.set_roi(corners)
+            self._whiteboard = DigitalWhiteboard(self._cv_worker._warp_w, self._cv_worker._warp_h)
+            self._twin_label.configure(text="")
+            self._refresh_twin()
+            self._cv_worker.start()
+            self._imu_player = CSVIMUPlayer(str(csv_path), self._imu_queue)
+            self._imu_player.start()
+            label = self._imu_player.writer_label or "?"
+            self._ble_status.configure(text=f"IMU: file  (writer hint: {label})", text_color="#3a9bd5")
+            self._cam_btn.configure(text=f"Live cam  (now: {video_path.stem})")
+            return
+
         if self._cv_worker:
             self._cv_worker.set_roi(corners)
         w = self._cv_worker._warp_w if self._cv_worker else 960
@@ -872,76 +1123,104 @@ class App(ctk.CTk):
     def _open_ble_popup(self) -> None:
         popup = ctk.CTkToplevel(self)
         popup.title("Connect Pen")
-        popup.geometry("360x260")
+        popup.geometry("400x300")
         popup.grab_set()
 
-        ctk.CTkLabel(popup, text="Scanning for BLE devices…").pack(pady=12)
-        status_lbl = ctk.CTkLabel(popup, text="", text_color="gray")
-        status_lbl.pack()
+        status_lbl = ctk.CTkLabel(popup, text="Scanning… (10 s)", text_color="gray")
+        status_lbl.pack(pady=(14, 4))
 
         device_var = ctk.StringVar(value="")
-        dev_menu   = ctk.CTkOptionMenu(popup, values=["Scanning…"], variable=device_var)
-        dev_menu.pack(padx=20, pady=8, fill="x")
-        dev_menu.configure(state="disabled")
+        dev_menu   = ctk.CTkOptionMenu(popup, values=["—"], variable=device_var, state="disabled")
+        dev_menu.pack(padx=20, pady=6, fill="x")
 
-        connect_btn = ctk.CTkButton(popup, text="Connect", state="disabled",
-                                    command=lambda: self._ble_connect(popup, status_lbl, connect_btn))
-        connect_btn.pack(padx=20, pady=8, fill="x")
+        btn_row = ctk.CTkFrame(popup, fg_color="transparent")
+        btn_row.pack(padx=20, pady=6, fill="x")
 
-        scan_fut = self._ble.scan(timeout=5.0)
+        rescan_btn  = ctk.CTkButton(btn_row, text="Rescan", width=100, state="disabled",
+                                    command=lambda: _start_scan())
+        rescan_btn.pack(side="left", padx=(0, 8))
 
-        def poll_scan():
-            if not scan_fut.done():
-                popup.after(200, poll_scan)
+        connect_btn = ctk.CTkButton(btn_row, text="Connect", state="disabled",
+                                    command=lambda: _do_connect())
+        connect_btn.pack(side="left", fill="x", expand=True)
+
+        def _device_label(d: bleak.BLEDevice) -> str:
+            return f"{d.name}  [{d.address}]" if d.name else d.address
+
+        def _start_scan() -> None:
+            rescan_btn.configure(state="disabled")
+            connect_btn.configure(state="disabled")
+            dev_menu.configure(state="disabled", values=["—"])
+            status_lbl.configure(text="Scanning… (10 s)", text_color="gray")
+            fut = self._ble.scan(timeout=10.0)
+
+            def _poll():
+                if not fut.done():
+                    popup.after(300, _poll)
+                    return
+                try:
+                    devices = fut.result()
+                except Exception:
+                    devices = []
+                self._ble_devices = devices
+                rescan_btn.configure(state="normal")
+                if devices:
+                    labels = [_device_label(d) for d in devices]
+                    dev_menu.configure(values=labels, state="normal")
+                    device_var.set(labels[0])
+                    connect_btn.configure(state="normal")
+                    status_lbl.configure(
+                        text=f"Found {len(devices)} device(s)", text_color="gray"
+                    )
+                else:
+                    status_lbl.configure(text="No devices found — try Rescan", text_color="orange")
+
+            popup.after(300, _poll)
+
+        def _do_connect() -> None:
+            sel = device_var.get()
+            device = next(
+                (d for d in self._ble_devices if _device_label(d) == sel), None
+            )
+            if device is None:
+                status_lbl.configure(text="Select a device first", text_color="orange")
                 return
-            devices = scan_fut.result()
-            self._ble_devices = devices
-            if devices:
-                names = [d.name or d.address for d in devices]
-                dev_menu.configure(values=names, state="normal")
-                device_var.set(names[0])
-                connect_btn.configure(state="normal")
-                status_lbl.configure(text=f"Found {len(devices)} device(s)")
-            else:
-                status_lbl.configure(text="No devices found")
 
-        popup.after(200, poll_scan)
+            connect_btn.configure(state="disabled", text="Connecting… (up to 30 s)")
+            rescan_btn.configure(state="disabled")
+            status_lbl.configure(text="Attempting connection (3 retries)…", text_color="gray")
 
-    def _ble_connect(
-        self,
-        popup: ctk.CTkToplevel,
-        status_lbl: ctk.CTkLabel,
-        btn: ctk.CTkButton,
-    ) -> None:
-        sel_name = popup.children.get("!ctkoptionmenu")
-        # Find the selected device by matching option menu value
-        sel_val = None
-        for child in popup.winfo_children():
-            if isinstance(child, ctk.CTkOptionMenu):
-                sel_val = child.get()
-                break
-        device = next(
-            (d for d in self._ble_devices if (d.name or d.address) == sel_val), None
-        )
-        if device is None:
-            status_lbl.configure(text="Device not found")
-            return
-        btn.configure(state="disabled", text="Connecting…")
-        fut = self._ble.connect(device)
+            def _on_disconnect() -> None:
+                self._ble_status.configure(text="Pen: disconnected", text_color="orange")
 
-        def poll_connect():
-            if not fut.done():
-                popup.after(200, poll_connect)
-                return
-            ok = fut.result()
-            if ok:
-                self._ble_status.configure(text=f"Pen: {device.name}", text_color="green")
-                popup.destroy()
-            else:
-                status_lbl.configure(text="Connection failed")
-                btn.configure(state="normal", text="Connect")
+            fut = self._ble.connect(device, on_disconnect=_on_disconnect)
 
-        popup.after(200, poll_connect)
+            def _poll():
+                if not fut.done():
+                    popup.after(300, _poll)
+                    return
+                try:
+                    ok = fut.result()
+                except Exception:
+                    ok = False
+                if ok:
+                    if self._imu_player is not None:
+                        self._imu_player.stop()
+                        self._imu_player = None
+                    label = device.name or device.address
+                    self._ble_status.configure(text=f"Pen: {label}", text_color="green")
+                    popup.destroy()
+                else:
+                    status_lbl.configure(
+                        text="Connection failed — check device is on and try again",
+                        text_color="red",
+                    )
+                    connect_btn.configure(state="normal", text="Connect")
+                    rescan_btn.configure(state="normal")
+
+            popup.after(300, _poll)
+
+        _start_scan()
 
     # ------------------------------------------------------------------
     # IMU polling
@@ -964,40 +1243,81 @@ class App(ctk.CTk):
 
         if self._pending_enroll is not None:
             writer_id = self._pending_enroll
-            self._writer_engine.enroll_segment(writer_id, segment)
+            self._writer_engine.enroll_segment(writer_id, segment, momentum=0.5)
             self._pending_enroll = None
+            self._last_writer = writer_id
+            self._below_thresh_count = 0
             color = self._whiteboard.get_writer_color(writer_id) if self._whiteboard else UNKNOWN_COLOR
             self._bulletin.post(BulletinEvent(kind="writer_enrolled", writer_id=writer_id))
             self._add_bulletin_row(f"Enrolled: {writer_id}", color)
             self._writer_label.configure(text=f"Enrolled: {writer_id}")
             return
 
-        writer_id, score = self._writer_engine.predict_segment(segment)
-        if writer_id is not None:
-            self._writer_engine.enroll_segment(writer_id, segment)
-            self._last_writer = writer_id
+        motion_var = float(np.var(scores))
+
+        # Enrollment phase: silently build up the prototype for ENROLL_STROKES
+        # strokes before comparison begins.  A single-stroke prototype is too
+        # fragile; intra-writer variance on the 2nd stroke would immediately
+        # trigger spurious new-writer creation.
+        current_enrolled = self._writer_stroke_counts.get(self._last_writer or "", 0)
+        if self._last_writer is not None and current_enrolled < ENROLL_STROKES:
+            writer_id = self._last_writer
+            if motion_var >= PROTOTYPE_UPDATE_VARIANCE:
+                self._writer_engine.enroll_segment(writer_id, segment, momentum=0.9)
+                self._writer_stroke_counts[writer_id] = current_enrolled + 1
+            score_str = f"building ({self._writer_stroke_counts.get(writer_id, 1)}/{ENROLL_STROKES})"
+            score = 0.0
+        else:
+            writer_id, score = self._writer_engine.predict_segment(segment)
+
+            if writer_id is not None:
+                self._below_thresh_count = 0
+                if score >= 0.88 and motion_var >= PROTOTYPE_UPDATE_VARIANCE:
+                    self._writer_engine.enroll_segment(writer_id, segment, momentum=0.95)
+                score_str = f"{score:.2f}"
+            else:
+                self._below_thresh_count += 1
+                if self._below_thresh_count < BELOW_THRESH_STRIKES and self._last_writer is not None:
+                    writer_id = self._last_writer
+                    score_str = f"~{score:.2f}"
+                else:
+                    # BELOW_THRESH_STRIKES consecutive misses: pen changed hands.
+                    self._below_thresh_count = 0
+                    self._auto_writer_count += 1
+                    writer_id = f"Writer {self._auto_writer_count}"
+                    self._writer_engine.enroll_segment(writer_id, segment, momentum=0.5)
+                    self._writer_stroke_counts[writer_id] = 1
+                    score_str = "new"
+
+        self._last_writer = writer_id
         self._bulletin.post(BulletinEvent(
             kind="pen_segment",
-            writer_id=writer_id or "unknown",
+            writer_id=writer_id,
             sim_score=score,
         ))
-        display = writer_id or "unknown"
-        color   = (self._whiteboard.get_writer_color(display) if self._whiteboard
-                   else UNKNOWN_COLOR)
-        ts_str  = time.strftime("%H:%M:%S")
-        self._add_bulletin_row(f"[{ts_str}] Pen: {display} ({score:.2f})", color)
-        self._writer_label.configure(text=f"Writer: {display} ({score:.2f})")
+        color  = (self._whiteboard.get_writer_color(writer_id) if self._whiteboard
+                  else UNKNOWN_COLOR)
+        ts_str = time.strftime("%H:%M:%S")
+        self._add_bulletin_row(f"[{ts_str}] Pen: {writer_id} ({score_str})", color)
+        self._writer_label.configure(text=f"Writer: {writer_id} ({score_str})")
 
     # ------------------------------------------------------------------
     # CV polling
     # ------------------------------------------------------------------
+    def _display_poll(self) -> None:
+        try:
+            while True:
+                frame = self._display_queue.get_nowait()
+                self._update_webcam_canvas(frame)
+        except queue.Empty:
+            pass
+        self.after(15, self._display_poll)
+
     def _cv_poll(self) -> None:
         try:
             while True:
                 result = self._cv_queue.get_nowait()
-                if result["type"] == "frame":
-                    self._update_webcam_canvas(result["raw"])
-                elif result["type"] == "changed":
+                if result["type"] == "changed":
                     self._handle_cv_change(result)
         except queue.Empty:
             pass
@@ -1019,35 +1339,46 @@ class App(ctk.CTk):
     def _handle_cv_change(self, result: dict) -> None:
         writer_id = self._bulletin.last_active_writer(time.time(), ATTRIBUTION_WINDOW) or "unknown"
         warped    = result["warped"]
+        contours  = result.get("contours", [])
 
-        if result["is_text"]:
-            ocr_results = self._ocr.run(warped)
-            for item in ocr_results:
-                if self._whiteboard:
-                    self._whiteboard.add_text(item["text"], item["box"], writer_id)
-                ts_str = time.strftime("%H:%M:%S")
-                color  = (self._whiteboard.get_writer_color(writer_id) if self._whiteboard
-                          else UNKNOWN_COLOR)
-                snippet = item["text"][:40]
-                self._bulletin.post(BulletinEvent(
-                    kind="cv_update", cv_type="ocr",
-                    writer_id=writer_id, text_content=item["text"],
-                ))
-                self._add_bulletin_row(f'[{ts_str}] OCR ({writer_id}): "{snippet}"', color)
+        # Crop warped frame to the bounding box of changed contours so OCR only
+        # sees freshly added ink and never re-detects text that was already on
+        # the board when the reference frame was set.
+        significant = [c for c in contours if cv2.contourArea(c) >= 50]
+        if significant:
+            pts = np.vstack([c.reshape(-1, 2) for c in significant])
+            pad = 24
+            ih, iw = warped.shape[:2]
+            x1 = int(max(0,  pts[:, 0].min() - pad))
+            y1 = int(max(0,  pts[:, 1].min() - pad))
+            x2 = int(min(iw, pts[:, 0].max() + pad))
+            y2 = int(min(ih, pts[:, 1].max() + pad))
+            roi = warped[y1:y2, x1:x2]
         else:
+            roi, x1, y1 = warped, 0, 0
+
+        if roi.size == 0:
+            return
+
+        ocr_results = self._ocr.run(roi)
+        for item in ocr_results:
+            # Translate bounding box back into full warped-frame coordinates
+            adj_box = item["box"].copy()
+            adj_box[:, 0] += x1
+            adj_box[:, 1] += y1
             if self._whiteboard:
-                self._whiteboard.add_trace(result["contours"], writer_id)
+                self._whiteboard.add_text(item["text"], adj_box, writer_id)
             color  = (self._whiteboard.get_writer_color(writer_id) if self._whiteboard
                       else UNKNOWN_COLOR)
-            ts_str = time.strftime("%H:%M:%S")
+            ts_str  = time.strftime("%H:%M:%S")
+            snippet = item["text"][:40]
             self._bulletin.post(BulletinEvent(
-                kind="cv_update", cv_type="trace", writer_id=writer_id,
+                kind="cv_update", cv_type="ocr",
+                writer_id=writer_id, text_content=item["text"],
             ))
-            self._add_bulletin_row(f"[{ts_str}] Trace ({writer_id})", color)
+            self._add_bulletin_row(f'[{ts_str}] OCR ({writer_id}): "{snippet}"', color)
 
-        if warped is not None:
-            self._update_snapshot_canvas(warped)
-
+        self._update_snapshot_canvas(warped)
         self._refresh_twin()
 
     def _update_snapshot_canvas(self, warped: np.ndarray) -> None:
@@ -1064,17 +1395,36 @@ class App(ctk.CTk):
     def _refresh_twin(self) -> None:
         if self._whiteboard is None:
             return
-        dw = self._twin_label.winfo_width()
-        dh = self._twin_label.winfo_height()
+        dw = self._twin_frame.winfo_width()
+        dh = self._twin_frame.winfo_height()
         if dw < 2 or dh < 2:
             dw, dh = 640, 480
         ctk_img = self._whiteboard.get_ctk_image(dw, dh)
-        self._twin_label.configure(image=ctk_img)
+        self._twin_label.configure(image=ctk_img, text="")
         self._twin_label._ctk_img_ref = ctk_img
 
     # ------------------------------------------------------------------
-    # Enrollment
+    # Enrollment / rename
     # ------------------------------------------------------------------
+    def _rename_last_writer(self) -> None:
+        new_name = self._name_entry.get().strip()
+        if not new_name:
+            self._writer_label.configure(text="Enter a name first")
+            return
+        old_name = self._last_writer
+        if old_name is None:
+            self._writer_label.configure(text="No active writer to rename")
+            return
+        if old_name == new_name:
+            return
+        reg = self._writer_engine.registry
+        if reg and old_name in reg.prototypes:
+            reg.prototypes[new_name] = reg.prototypes.pop(old_name)
+        if self._whiteboard and old_name in self._whiteboard._writer_colors:
+            self._whiteboard._writer_colors[new_name] = self._whiteboard._writer_colors.pop(old_name)
+        self._last_writer = new_name
+        self._writer_label.configure(text=f"Renamed: {old_name} → {new_name}")
+
     def _arm_enrollment(self) -> None:
         name = self._name_entry.get().strip()
         if not name:
@@ -1114,11 +1464,97 @@ class App(ctk.CTk):
         self._bulletin_scroll._parent_canvas.yview_moveto(1.0)
 
     # ------------------------------------------------------------------
+    # Recording playback
+    # ------------------------------------------------------------------
+    def _discover_recording_pairs(self) -> List[dict]:
+        pairs = []
+        for video in sorted(_MEDIA_DIR.glob("recording*.mp4")):
+            prefix = video.stem  # e.g. "recording1"
+            csvs = sorted(_MEDIA_DIR.glob(f"{prefix}_*.csv"))
+            if not csvs:
+                continue
+            csv = csvs[0]
+            parts = csv.stem.split("_")
+            label = parts[1] if len(parts) > 1 else "?"
+            pairs.append({"video": video, "csv": csv, "label": label,
+                          "name": f"{prefix}  (writer: {label})"})
+        return pairs
+
+    def _open_recording_picker(self) -> None:
+        pairs = self._discover_recording_pairs()
+        if not pairs:
+            self._writer_label.configure(text="No recordings found in onnx/")
+            return
+
+        popup = ctk.CTkToplevel(self)
+        popup.title("Load Recording")
+        popup.geometry("360x180")
+        popup.grab_set()
+
+        ctk.CTkLabel(popup, text="Select a recording pair:").pack(pady=(16, 4))
+
+        names = [p["name"] for p in pairs]
+        sel_var = ctk.StringVar(value=names[0])
+        ctk.CTkOptionMenu(popup, values=names, variable=sel_var).pack(padx=20, pady=8, fill="x")
+
+        def _do_load() -> None:
+            chosen = next(p for p in pairs if p["name"] == sel_var.get())
+            popup.destroy()
+            self._load_recording(chosen["video"], chosen["csv"])
+
+        ctk.CTkButton(popup, text="Load", command=_do_load).pack(padx=20, pady=8, fill="x")
+
+    def _load_recording(self, video_path: Path, csv_path: Path) -> None:
+        # Stop any existing sources
+        if self._cv_worker is not None:
+            self._cv_worker.stop()
+            self._cv_worker = None
+        if self._imu_player is not None:
+            self._imu_player.stop()
+            self._imu_player = None
+        self._vid = None
+        self._pending_recording = None
+        self._whiteboard = None
+        self._twin_label.configure(text="No ROI selected")
+        self._auto_writer_count   = 0
+        self._below_thresh_count  = 0
+        self._last_writer         = None
+        self._writer_stroke_counts = {}
+        if self._writer_engine.registry:
+            self._writer_engine.registry.prototypes.clear()
+
+        for q in (self._imu_queue, self._display_queue, self._cv_queue):
+            while not q.empty():
+                try: q.get_nowait()
+                except queue.Empty: break
+
+        # Show first frame as a static preview so the user can select ROI
+        # before any data starts flowing.
+        _cap = cv2.VideoCapture(str(video_path))
+        ok, frame = _cap.read()
+        _cap.release()
+        if ok:
+            self._update_webcam_canvas(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+
+        # Non-None sentinel so _toggle_roi doesn't bail before playback starts
+        self._vid = True  # type: ignore[assignment]
+        self._pending_recording = (video_path, csv_path)
+
+        parts = csv_path.stem.split("_")
+        label = parts[1] if len(parts) > 1 else "?"
+        self._ble_status.configure(text=f"IMU: file  (writer hint: {label})", text_color="#3a9bd5")
+        self._cam_btn.configure(text=f"Loaded: {video_path.stem}")
+        self._roi_btn.configure(text="Select ROI to start")
+        self._writer_label.configure(text="Select ROI to begin playback")
+
+    # ------------------------------------------------------------------
     # Cleanup
     # ------------------------------------------------------------------
     def on_closing(self) -> None:
         if self._cv_worker:
             self._cv_worker.stop()
+        if self._imu_player:
+            self._imu_player.stop()
         self._ble.disconnect()
         self._ble.stop()
         self.destroy()
@@ -1129,5 +1565,7 @@ if __name__ == "__main__":
     ctk.set_default_color_theme("blue")
     app = App()
     app.protocol("WM_DELETE_WINDOW", app.on_closing)
+    sess_options = ort.SessionOptions()
+    sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     app.mainloop()
 

@@ -3,3 +3,10 @@ ml/datasets
 # Python Ignores
 *.cpython
 sw/src/__pycache__
+
+# ML Ignores
+*.pt
+*.npy
+
+# Recording Ignores
+*.mp4
