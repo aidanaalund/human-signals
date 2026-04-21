@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import math
 import queue
 import struct
@@ -8,7 +9,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Deque, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 
@@ -110,7 +111,7 @@ class WriterIdentityEngine:
         onnx_path: Path = STYLE_ENCODER_PATH,
         channel_mean_path: Path = CHANNEL_MEAN_PATH,
         channel_std_path: Path = CHANNEL_STD_PATH,
-        unknown_threshold: float = 0.88,
+        unknown_threshold: float = 0.70,
         onnx_provider: str = "CPUExecutionProvider",
     ) -> None:
         self._onnx_path = onnx_path
@@ -162,6 +163,20 @@ class WriterIdentityEngine:
         if not self._loaded:
             self.load()
         self.registry.update_writer(writer_id=writer_id, segment=segment, momentum=momentum)
+
+    def best_match_segment(self, segment: np.ndarray) -> Tuple[Optional[str], float]:
+        """Return the best-matching writer and score regardless of the unknown threshold."""
+        if not self._loaded:
+            self.load()
+        if not self.registry or not self.registry.prototypes:
+            return None, 0.0
+        emb = self.registry._embed_one(segment)
+        best_writer, best_sim = None, -1.0
+        for wid, proto in self.registry.prototypes.items():
+            sim = float(np.dot(emb, proto))
+            if sim > best_sim:
+                best_sim, best_writer = sim, wid
+        return best_writer, float(best_sim)
 
 
 # ---------------------------------------------------------------------------
@@ -485,15 +500,14 @@ class ROISelector:
 # ---------------------------------------------------------------------------
 class CVWorker:
     PROCESS_INTERVAL      = 0.2   # CV analysis at 5fps
-    WARP_WIDTH            = 1280  # wider warp → finer OCR resolution
-    STABILITY_FRAMES      = 4     # ticks of stability required to set initial reference
-    STABILITY_THRESH      = 8.0   # mean diff threshold — coarse motion gate
-    OCR_STABILITY_FRAMES  = 7     # ~1.4 s of quiet required before OCR fires
-    OCR_STABILITY_THRESH  = 5.0   # resets on person motion; ignores camera/sensor noise
-    CHANGE_COVERAGE_MIN   = 0.001 # <0.1% changed pixels → nothing new
+    WARP_WIDTH            = 1280
+    STABILITY_FRAMES      = 4     # ticks to set initial reference
+    STABILITY_THRESH      = 8.0   # coarse motion gate
+    OCR_STABILITY_FRAMES  = 5     # ~1 s of stillness required to fire OCR
+    OCR_STABILITY_THRESH  = 8.0   # resets on writing motion; passes when writer is still
+    CHANGE_COVERAGE_MIN   = 0.001
     DIFF_THRESH           = 30
-    PERSON_BLOB_FRAC      = 0.07  # single contour > 7% of image AND solid → person
-    OCR_MIN_INTERVAL      = 4.0   # minimum seconds between OCR triggers
+    OCR_MIN_INTERVAL      = 5.0   # minimum seconds between OCR triggers
 
     def __init__(
         self,
@@ -509,13 +523,15 @@ class CVWorker:
         self._M:   Optional[np.ndarray] = None
         self._warp_w = self.WARP_WIDTH
         self._warp_h = self.WARP_WIDTH
-        self._reference: Optional[np.ndarray] = None
-        self._ref_norm:  Optional[np.ndarray] = None
-        self._prev_norm: Optional[np.ndarray] = None
+        self._reference:    Optional[np.ndarray] = None
+        self._ref_norm:     Optional[np.ndarray] = None
+        self._prev_norm:    Optional[np.ndarray] = None
+        self._latest_warped: Optional[np.ndarray] = None
+        self._latest_norm:   Optional[np.ndarray] = None
         self._stable_count     = 0
         self._ocr_stable_count = 0
-        self._last_process     = 0.0
         self._last_change_post = 0.0
+        self._last_process     = 0.0
         self._running = False
         self._thread: Optional[threading.Thread] = None
 
@@ -523,11 +539,14 @@ class CVWorker:
         with self._lock:
             self._corners = corners
             self._M, self._warp_w, self._warp_h = self._compute_warp(corners)
-            self._reference       = None
-            self._ref_norm        = None
-            self._prev_norm       = None
-            self._stable_count    = 0
+            self._reference        = None
+            self._ref_norm         = None
+            self._prev_norm        = None
+            self._latest_warped    = None
+            self._latest_norm      = None
+            self._stable_count     = 0
             self._ocr_stable_count = 0
+            self._last_change_post = 0.0
 
     def clear_roi(self) -> None:
         with self._lock:
@@ -597,57 +616,80 @@ class CVWorker:
         warped   = cv2.warpPerspective(frame, M, (warp_w, warp_h))
         norm_new = self._normalize_illumination(warped)
 
+        inter = 0.0
         if self._prev_norm is not None:
             inter = float(cv2.absdiff(norm_new, self._prev_norm).mean())
             self._stable_count     = self._stable_count     + 1 if inter < self.STABILITY_THRESH     else 0
             self._ocr_stable_count = self._ocr_stable_count + 1 if inter < self.OCR_STABILITY_THRESH else 0
         self._prev_norm = norm_new
 
-        # Phase 1 — no reference yet: require full stability window before setting it.
+        with self._lock:
+            self._latest_warped = warped
+            self._latest_norm   = norm_new
+
+        # Phase 1 — set reference once the scene is stable.
         if self._reference is None:
-            if self._stable_count < self.STABILITY_FRAMES:
-                return
-            self._reference = warped.copy()
-            self._ref_norm  = norm_new.copy()
+            if self._stable_count >= self.STABILITY_FRAMES:
+                with self._lock:
+                    self._reference = warped.copy()
+                    self._ref_norm  = norm_new.copy()
             return
 
-        # Phase 2 — only fire OCR once the scene has been continuously quiet for
-        # OCR_STABILITY_FRAMES ticks (~2 s).  Any motion — person breathing,
-        # arm near the board, hair — resets this counter, so OCR only runs when
-        # nobody is close to the whiteboard and the text is fully drawn.
+        # Phase 2 — fire OCR when scene has been still for OCR_STABILITY_FRAMES ticks.
         if self._ocr_stable_count < self.OCR_STABILITY_FRAMES:
             return
 
-        diff     = cv2.absdiff(norm_new, self._ref_norm)
+        with self._lock:
+            ref_norm = self._ref_norm.copy()
+
+        diff     = cv2.absdiff(norm_new, ref_norm)
         mask     = (diff > self.DIFF_THRESH).astype(np.uint8)
         coverage = float(mask.mean())
 
         if coverage < self.CHANGE_COVERAGE_MIN:
             return
 
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        if self._has_person_blob(contours, mask):
-            return
-
-        # Rate-limit OCR triggers.  During cooldown, leave the reference unchanged
-        # so incremental changes accumulate and the next trigger sees the full diff.
         now = time.monotonic()
         if now - self._last_change_post < self.OCR_MIN_INTERVAL:
             return
 
         self._last_change_post = now
-        self._reference = warped.copy()
-        self._ref_norm  = norm_new.copy()
+        with self._lock:
+            self._reference = warped.copy()
+            self._ref_norm  = norm_new.copy()
 
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         try:
-            self._q.put_nowait({
-                "type":     "changed",
-                "warped":   warped,
-                "contours": contours,
-            })
+            self._q.put_nowait({"warped": warped, "contours": contours})
         except queue.Full:
             pass
+
+    def get_change_info(self) -> Optional[dict]:
+        """Called from main thread when pen goes idle. Returns diff vs reference."""
+        with self._lock:
+            if self._reference is None or self._latest_warped is None:
+                return None
+            warped   = self._latest_warped.copy()
+            ref_norm = self._ref_norm.copy()
+
+        norm_new = self._normalize_illumination(warped)
+        diff     = cv2.absdiff(norm_new, ref_norm)
+        mask     = (diff > self.DIFF_THRESH).astype(np.uint8)
+        coverage = float(mask.mean())
+
+        if coverage < self.CHANGE_COVERAGE_MIN:
+            return None
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        return {"warped": warped, "contours": contours}
+
+    def advance_reference(self) -> None:
+        """Commit latest warped frame as the new reference after OCR completes."""
+        with self._lock:
+            if self._latest_warped is not None:
+                self._reference = self._latest_warped.copy()
+                self._ref_norm  = self._latest_norm.copy()
 
     def _has_person_blob(self, contours: tuple, mask: np.ndarray) -> bool:
         total = mask.shape[0] * mask.shape[1]
@@ -729,8 +771,13 @@ class PaddleOCRPipeline:
         texts = self._recognize(img_rgb, boxes)
         results = []
         for box, (text, conf) in zip(boxes, texts):
-            if text and conf >= 0.55:  # discard low-confidence hits (hair, glare, etc.)
-                results.append({"text": text, "conf": conf, "box": box})
+            if not text or conf < 0.65:
+                continue
+            stripped = text.strip()
+            # Single punctuation character is almost always a misread dot or comma.
+            if len(stripped) == 1 and not stripped.isalnum():
+                continue
+            results.append({"text": stripped, "conf": conf, "box": box})
         return results
 
     def _detect(self, img_rgb: np.ndarray) -> List[np.ndarray]:
@@ -753,7 +800,7 @@ class PaddleOCRPipeline:
         scale_y = new_h / h
         boxes = []
         for c in contours:
-            if cv2.contourArea(c) < 50:  # was 100; catches thin letters like l/i
+            if cv2.contourArea(c) < 20:  # low threshold preserves thin strokes (l, i, 1)
                 continue
             rect  = cv2.minAreaRect(c)
             pts   = cv2.boxPoints(rect).astype(np.float32)
@@ -900,11 +947,17 @@ class DigitalWhiteboard:
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
-MIN_MOTION_VARIANCE        = 0.05   # minimum variance to pass attribution
+MIN_MOTION_VARIANCE        = 0.08   # minimum variance to pass attribution
+MAX_MOTION_VARIANCE        = 5.0    # above this = handoff shaking, not writing — skip entirely
 PROTOTYPE_UPDATE_VARIANCE  = 0.10   # higher bar — only update model with clear writing
 ATTRIBUTION_WINDOW         = 10.0
-ENROLL_STROKES             = 5      # strokes collected silently before comparison starts
-BELOW_THRESH_STRIKES       = 3      # consecutive below-threshold strokes → new writer
+ENROLL_STROKES             = 3      # strokes collected silently before comparison starts
+BELOW_THRESH_STRIKES       = 3      # misses in MATCH_WINDOW → new writer
+MATCH_WINDOW               = 6      # rolling window for writer-switch detection
+PEN_RESET_SECS             = 3.0    # seconds of pen silence → clear match window
+PEN_WRITER_RESET_SECS      = 15.0   # longer silence → also clear writer identity (likely handoff)
+MIN_PEN_IDLE_FOR_OCR       = 0.5    # seconds of pen silence before OCR is processed
+SOFT_REIDENTIFY_THRESHOLD  = 0.62   # before creating a new writer, soft-match against known prototypes
 
 
 class App(ctk.CTk):
@@ -915,12 +968,12 @@ class App(ctk.CTk):
 
         self._imu_queue:     queue.Queue = queue.Queue(maxsize=500)
         self._display_queue: queue.Queue = queue.Queue(maxsize=2)
-        self._cv_queue:      queue.Queue = queue.Queue(maxsize=20)
+        self._cv_queue:      queue.Queue = queue.Queue(maxsize=4)
 
         self._writer_engine = WriterIdentityEngine()
         self._ocr            = PaddleOCRPipeline()
         self._ble            = BLEManager(self._imu_queue)
-        self._segmenter      = Segmenter(min_active_samples=18)
+        self._segmenter      = Segmenter(min_active_samples=25)
         self._bulletin       = BulletinBoard()
         self._whiteboard: Optional[DigitalWhiteboard] = None
         self._cv_worker: Optional[CVWorker] = None
@@ -930,9 +983,14 @@ class App(ctk.CTk):
         self._ble_devices: List[bleak.BLEDevice] = []
         self._imu_player: Optional[CSVIMUPlayer] = None
         self._pending_recording: Optional[Tuple[Path, Path]] = None
+        self._pen_reset_timer: Optional[str] = None
+        self._writer_reset_timer: Optional[str] = None
+        self._whiteboard_text_count: int = 0
         self._auto_writer_count = 0
-        self._below_thresh_count: int = 0
+        self._match_buffer: Deque[bool] = collections.deque(maxlen=MATCH_WINDOW)
         self._writer_stroke_counts: Dict[str, int] = {}
+        self._last_stroke_time: float = 0.0
+        self._ocr_attributions: List[dict] = []
         self._bulletin_labels: List[ctk.CTkFrame] = []
 
         # camera list for selector
@@ -944,8 +1002,8 @@ class App(ctk.CTk):
         self._roi_selector = ROISelector(self._webcam_canvas, self._on_roi_selected)
 
         self._imu_poll()
-        self._cv_poll()
         self._display_poll()
+        self._cv_poll()
 
     # ------------------------------------------------------------------
     # UI construction
@@ -1041,9 +1099,15 @@ class App(ctk.CTk):
     def _connect_camera(self) -> None:
         self._pending_recording   = None
         self._auto_writer_count   = 0
-        self._below_thresh_count  = 0
+        self._match_buffer.clear()
         self._last_writer         = None
         self._writer_stroke_counts = {}
+        if self._pen_reset_timer is not None:
+            self.after_cancel(self._pen_reset_timer)
+            self._pen_reset_timer = None
+        if self._writer_reset_timer is not None:
+            self.after_cancel(self._writer_reset_timer)
+            self._writer_reset_timer = None
         if self._writer_engine.registry:
             self._writer_engine.registry.prototypes.clear()
         if self._imu_player is not None:
@@ -1099,13 +1163,15 @@ class App(ctk.CTk):
             self._cv_worker = CVWorker(self._vid, self._display_queue, self._cv_queue)
             self._cv_worker.set_roi(corners)
             self._whiteboard = DigitalWhiteboard(self._cv_worker._warp_w, self._cv_worker._warp_h)
+            self._whiteboard_text_count = 0
+            self._ocr_attributions = []
             self._twin_label.configure(text="")
             self._refresh_twin()
             self._cv_worker.start()
             self._imu_player = CSVIMUPlayer(str(csv_path), self._imu_queue)
             self._imu_player.start()
             label = self._imu_player.writer_label or "?"
-            self._ble_status.configure(text=f"IMU: file  (writer hint: {label})", text_color="#3a9bd5")
+            self._ble_status.configure(text=f"IMU: file {label}", text_color="#3a9bd5")
             self._cam_btn.configure(text=f"Live cam  (now: {video_path.stem})")
             return
 
@@ -1114,6 +1180,8 @@ class App(ctk.CTk):
         w = self._cv_worker._warp_w if self._cv_worker else 960
         h = self._cv_worker._warp_h if self._cv_worker else 540
         self._whiteboard = DigitalWhiteboard(w, h)
+        self._whiteboard_text_count = 0
+        self._ocr_attributions = []
         self._twin_label.configure(text="")
         self._refresh_twin()
 
@@ -1238,22 +1306,26 @@ class App(ctk.CTk):
 
     def _on_segment(self, segment: np.ndarray) -> None:
         scores = [Segmenter.motion_score(s) for s in segment]
-        if float(np.var(scores)) < MIN_MOTION_VARIANCE:
+        motion_var = float(np.var(scores))
+        if motion_var < MIN_MOTION_VARIANCE:
             return
+        if motion_var > MAX_MOTION_VARIANCE:
+            # Handoff shaking / accidental drop — don't touch the match buffer.
+            return
+
+        self._last_stroke_time = time.time()
 
         if self._pending_enroll is not None:
             writer_id = self._pending_enroll
             self._writer_engine.enroll_segment(writer_id, segment, momentum=0.5)
             self._pending_enroll = None
             self._last_writer = writer_id
-            self._below_thresh_count = 0
+            self._match_buffer.clear()
             color = self._whiteboard.get_writer_color(writer_id) if self._whiteboard else UNKNOWN_COLOR
             self._bulletin.post(BulletinEvent(kind="writer_enrolled", writer_id=writer_id))
             self._add_bulletin_row(f"Enrolled: {writer_id}", color)
             self._writer_label.configure(text=f"Enrolled: {writer_id}")
             return
-
-        motion_var = float(np.var(scores))
 
         # Enrollment phase: silently build up the prototype for ENROLL_STROKES
         # strokes before comparison begins.  A single-stroke prototype is too
@@ -1263,7 +1335,7 @@ class App(ctk.CTk):
         if self._last_writer is not None and current_enrolled < ENROLL_STROKES:
             writer_id = self._last_writer
             if motion_var >= PROTOTYPE_UPDATE_VARIANCE:
-                self._writer_engine.enroll_segment(writer_id, segment, momentum=0.9)
+                self._writer_engine.enroll_segment(writer_id, segment, momentum=0.6)
                 self._writer_stroke_counts[writer_id] = current_enrolled + 1
             score_str = f"building ({self._writer_stroke_counts.get(writer_id, 1)}/{ENROLL_STROKES})"
             score = 0.0
@@ -1271,23 +1343,42 @@ class App(ctk.CTk):
             writer_id, score = self._writer_engine.predict_segment(segment)
 
             if writer_id is not None:
-                self._below_thresh_count = 0
+                self._match_buffer.append(True)
                 if score >= 0.88 and motion_var >= PROTOTYPE_UPDATE_VARIANCE:
                     self._writer_engine.enroll_segment(writer_id, segment, momentum=0.95)
                 score_str = f"{score:.2f}"
             else:
-                self._below_thresh_count += 1
-                if self._below_thresh_count < BELOW_THRESH_STRIKES and self._last_writer is not None:
+                self._match_buffer.append(False)
+                misses = self._match_buffer.count(False)
+                if misses >= BELOW_THRESH_STRIKES or self._last_writer is None:
+                    self._match_buffer.clear()
+                    if self._last_writer is not None:
+                        # Before creating a new writer, check whether a DIFFERENT known
+                        # prototype is a plausible soft match — handles returning participants.
+                        # Explicitly exclude _last_writer: failing against the current writer
+                        # and soft-matching back to them just means "similar style, new person."
+                        best_cand, best_cand_score = self._writer_engine.best_match_segment(segment)
+                        if (best_cand is not None and
+                                best_cand != self._last_writer and
+                                best_cand_score >= SOFT_REIDENTIFY_THRESHOLD):
+                            writer_id = best_cand
+                            self._writer_engine.enroll_segment(writer_id, segment, momentum=0.85)
+                            score_str = f"re-id:{best_cand_score:.2f}"
+                        else:
+                            self._auto_writer_count += 1
+                            writer_id = f"Writer {self._auto_writer_count}"
+                            self._writer_engine.enroll_segment(writer_id, segment, momentum=0.5)
+                            self._writer_stroke_counts[writer_id] = 1
+                            score_str = "new"
+                    else:
+                        self._auto_writer_count += 1
+                        writer_id = f"Writer {self._auto_writer_count}"
+                        self._writer_engine.enroll_segment(writer_id, segment, momentum=0.5)
+                        self._writer_stroke_counts[writer_id] = 1
+                        score_str = "new"
+                else:
                     writer_id = self._last_writer
                     score_str = f"~{score:.2f}"
-                else:
-                    # BELOW_THRESH_STRIKES consecutive misses: pen changed hands.
-                    self._below_thresh_count = 0
-                    self._auto_writer_count += 1
-                    writer_id = f"Writer {self._auto_writer_count}"
-                    self._writer_engine.enroll_segment(writer_id, segment, momentum=0.5)
-                    self._writer_stroke_counts[writer_id] = 1
-                    score_str = "new"
 
         self._last_writer = writer_id
         self._bulletin.post(BulletinEvent(
@@ -1301,6 +1392,15 @@ class App(ctk.CTk):
         self._add_bulletin_row(f"[{ts_str}] Pen: {writer_id} ({score_str})", color)
         self._writer_label.configure(text=f"Writer: {writer_id} ({score_str})")
 
+        # Short timer: clear only the match window (intra-word pauses).
+        if self._pen_reset_timer is not None:
+            self.after_cancel(self._pen_reset_timer)
+        self._pen_reset_timer = self.after(int(PEN_RESET_SECS * 1000), self._on_pen_reset)
+        # Long timer: also clear writer identity (pen has been idle long enough to be a handoff).
+        if self._writer_reset_timer is not None:
+            self.after_cancel(self._writer_reset_timer)
+        self._writer_reset_timer = self.after(int(PEN_WRITER_RESET_SECS * 1000), self._on_writer_reset)
+
     # ------------------------------------------------------------------
     # CV polling
     # ------------------------------------------------------------------
@@ -1313,14 +1413,27 @@ class App(ctk.CTk):
             pass
         self.after(15, self._display_poll)
 
+    def _on_pen_reset(self) -> None:
+        self._pen_reset_timer = None
+        # Don't clear the match buffer here — let it slide naturally via deque maxlen.
+        # Any clear here loses accumulated miss evidence (False entries) when P2 happens
+        # to get a stray True reading between pauses.
+
+    def _on_writer_reset(self) -> None:
+        self._writer_reset_timer = None
+        self._last_writer = None
+        self._match_buffer.clear()
+
     def _cv_poll(self) -> None:
+        # Drain the queue, keeping only the most recent result.
+        latest = None
         try:
             while True:
-                result = self._cv_queue.get_nowait()
-                if result["type"] == "changed":
-                    self._handle_cv_change(result)
+                latest = self._cv_queue.get_nowait()
         except queue.Empty:
             pass
+        if latest is not None and time.time() - self._last_stroke_time >= MIN_PEN_IDLE_FOR_OCR:
+            self._handle_cv_change(latest)
         self.after(50, self._cv_poll)
 
     def _update_webcam_canvas(self, frame: np.ndarray) -> None:
@@ -1336,50 +1449,80 @@ class App(ctk.CTk):
         self._webcam_canvas.create_image(0, 0, image=photo, anchor=tk.NW, tags="video")
         self._webcam_canvas._photo_ref = photo  # prevent GC
 
+    @staticmethod
+    def _boxes_near(a: List, b: List, x_tol: float = 100.0, y_tol: float = 30.0) -> bool:
+        # Elliptical tolerance: lenient in x (words grow rightward as writing continues),
+        # strict in y (each line of text stays at its own row).
+        ca = np.mean(np.array(a, dtype=np.float32), axis=0)
+        cb = np.mean(np.array(b, dtype=np.float32), axis=0)
+        return ((ca[0] - cb[0]) ** 2 / x_tol ** 2 +
+                (ca[1] - cb[1]) ** 2 / y_tol ** 2) < 1.0
+
     def _handle_cv_change(self, result: dict) -> None:
-        writer_id = self._bulletin.last_active_writer(time.time(), ATTRIBUTION_WINDOW) or "unknown"
-        warped    = result["warped"]
-        contours  = result.get("contours", [])
+        current_writer = self._bulletin.last_active_writer(time.time(), ATTRIBUTION_WINDOW) or "unknown"
+        warped = result["warped"]
+        self._update_snapshot_canvas(warped)
 
-        # Crop warped frame to the bounding box of changed contours so OCR only
-        # sees freshly added ink and never re-detects text that was already on
-        # the board when the reference frame was set.
-        significant = [c for c in contours if cv2.contourArea(c) >= 50]
-        if significant:
-            pts = np.vstack([c.reshape(-1, 2) for c in significant])
-            pad = 24
-            ih, iw = warped.shape[:2]
-            x1 = int(max(0,  pts[:, 0].min() - pad))
-            y1 = int(max(0,  pts[:, 1].min() - pad))
-            x2 = int(min(iw, pts[:, 0].max() + pad))
-            y2 = int(min(ih, pts[:, 1].max() + pad))
-            roi = warped[y1:y2, x1:x2]
-        else:
-            roi, x1, y1 = warped, 0, 0
-
-        if roi.size == 0:
+        ocr_results = self._ocr.run(warped)
+        if not ocr_results:
             return
 
-        ocr_results = self._ocr.run(roi)
+        # Additive model: text regions only accumulate — existing entries are never removed
+        # because the writer's hand may be temporarily covering them. Updates are accepted
+        # only when strictly better: higher confidence AND same-or-longer text (word grew).
+        whiteboard_changed = False
         for item in ocr_results:
-            # Translate bounding box back into full warped-frame coordinates
-            adj_box = item["box"].copy()
-            adj_box[:, 0] += x1
-            adj_box[:, 1] += y1
-            if self._whiteboard:
-                self._whiteboard.add_text(item["text"], adj_box, writer_id)
-            color  = (self._whiteboard.get_writer_color(writer_id) if self._whiteboard
-                      else UNKNOWN_COLOR)
-            ts_str  = time.strftime("%H:%M:%S")
-            snippet = item["text"][:40]
-            self._bulletin.post(BulletinEvent(
-                kind="cv_update", cv_type="ocr",
-                writer_id=writer_id, text_content=item["text"],
-            ))
-            self._add_bulletin_row(f'[{ts_str}] OCR ({writer_id}): "{snippet}"', color)
+            matched_idx: Optional[int] = None
+            for i, old in enumerate(self._ocr_attributions):
+                if self._boxes_near(item["box"], old["box"]):
+                    matched_idx = i
+                    break
 
-        self._update_snapshot_canvas(warped)
-        self._refresh_twin()
+            if matched_idx is not None:
+                old = self._ocr_attributions[matched_idx]
+                new_text = item["text"]
+                old_text = old["text"]
+                # A genuine word-growth update shares its leading characters with the
+                # stored text. "Shopping" growing from "Shop" passes; "hopping" replacing
+                # "shop" (box shifted because the 'S' was missed) fails the prefix check.
+                prefix_len = min(len(old_text), len(new_text), 3)
+                same_prefix = (new_text[:prefix_len].lower() ==
+                               old_text[:prefix_len].lower())
+                # Accept if longer with same prefix (word grew), or same length with higher
+                # confidence. Confidence alone is not required for longer text — a partial
+                # read of a growing word often has artificially high confidence.
+                longer_growth = len(new_text) > len(old_text) and same_prefix
+                better_same_len = (len(new_text) == len(old_text) and same_prefix and
+                                   item["conf"] > old.get("conf", 0.0))
+                if longer_growth or better_same_len:
+                    self._ocr_attributions[matched_idx] = {
+                        "box": item["box"], "text": new_text,
+                        "conf": item["conf"], "writer_id": old["writer_id"],
+                    }
+                    whiteboard_changed = True
+            else:
+                self._ocr_attributions.append({
+                    "box": item["box"], "text": item["text"],
+                    "conf": item["conf"], "writer_id": current_writer,
+                })
+                writer_id = current_writer
+                color = (self._whiteboard.get_writer_color(writer_id) if self._whiteboard
+                         else UNKNOWN_COLOR)
+                ts_str = time.strftime("%H:%M:%S")
+                self._bulletin.post(BulletinEvent(
+                    kind="cv_update", cv_type="ocr",
+                    writer_id=writer_id, text_content=item["text"],
+                ))
+                self._add_bulletin_row(
+                    f'[{ts_str}] OCR ({writer_id}): "{item["text"][:40]}"', color
+                )
+                whiteboard_changed = True
+
+        if whiteboard_changed and self._whiteboard:
+            self._whiteboard.clear()
+            for attr in self._ocr_attributions:
+                self._whiteboard.add_text(attr["text"], attr["box"], attr["writer_id"])
+            self._refresh_twin()
 
     def _update_snapshot_canvas(self, warped: np.ndarray) -> None:
         cw = self._snapshot_canvas.winfo_width()
@@ -1515,11 +1658,14 @@ class App(ctk.CTk):
         self._vid = None
         self._pending_recording = None
         self._whiteboard = None
+        self._whiteboard_text_count = 0
         self._twin_label.configure(text="No ROI selected")
         self._auto_writer_count   = 0
-        self._below_thresh_count  = 0
+        self._match_buffer.clear()
         self._last_writer         = None
         self._writer_stroke_counts = {}
+        self._whiteboard_text_count = 0
+        self._ocr_attributions = []
         if self._writer_engine.registry:
             self._writer_engine.registry.prototypes.clear()
 
