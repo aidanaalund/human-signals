@@ -111,7 +111,7 @@ class WriterIdentityEngine:
         onnx_path: Path = STYLE_ENCODER_PATH,
         channel_mean_path: Path = CHANNEL_MEAN_PATH,
         channel_std_path: Path = CHANNEL_STD_PATH,
-        unknown_threshold: float = 0.70,
+        unknown_threshold: float = 0.65,
         onnx_provider: str = "CPUExecutionProvider",
     ) -> None:
         self._onnx_path = onnx_path
@@ -503,11 +503,12 @@ class CVWorker:
     WARP_WIDTH            = 1280
     STABILITY_FRAMES      = 4     # ticks to set initial reference
     STABILITY_THRESH      = 8.0   # coarse motion gate
-    OCR_STABILITY_FRAMES  = 5     # ~1 s of stillness required to fire OCR
+    OCR_STABILITY_FRAMES  = 1    # ~0.2 s of stillness required to fire OCR
     OCR_STABILITY_THRESH  = 8.0   # resets on writing motion; passes when writer is still
     CHANGE_COVERAGE_MIN   = 0.001
     DIFF_THRESH           = 30
     OCR_MIN_INTERVAL      = 5.0   # minimum seconds between OCR triggers
+    PERSON_BLOB_FRAC      = 0.05  # contour covering >5% of ROI with solidity>0.5 = arm/person
 
     def __init__(
         self,
@@ -653,12 +654,17 @@ class CVWorker:
         if now - self._last_change_post < self.OCR_MIN_INTERVAL:
             return
 
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # if self._has_person_blob(contours, mask):
+        #     # Arm/person in the ROI — OCR would read their hand or clothing.
+        #     # Don't advance the reference so the diff remains fresh once they leave.
+        #     return
+
         self._last_change_post = now
         with self._lock:
             self._reference = warped.copy()
             self._ref_norm  = norm_new.copy()
 
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         try:
             self._q.put_nowait({"warped": warped, "contours": contours})
         except queue.Full:
@@ -951,13 +957,14 @@ MIN_MOTION_VARIANCE        = 0.08   # minimum variance to pass attribution
 MAX_MOTION_VARIANCE        = 5.0    # above this = handoff shaking, not writing — skip entirely
 PROTOTYPE_UPDATE_VARIANCE  = 0.10   # higher bar — only update model with clear writing
 ATTRIBUTION_WINDOW         = 10.0
-ENROLL_STROKES             = 3      # strokes collected silently before comparison starts
-BELOW_THRESH_STRIKES       = 3      # misses in MATCH_WINDOW → new writer
-MATCH_WINDOW               = 6      # rolling window for writer-switch detection
+ENROLL_STROKES             = 2      # strokes collected silently before comparison starts
+BELOW_THRESH_STRIKES       = 2      # misses in MATCH_WINDOW → new writer (faster handoff detection)
+MATCH_WINDOW               = 18      # rolling window for writer-switch detection
 PEN_RESET_SECS             = 3.0    # seconds of pen silence → clear match window
-PEN_WRITER_RESET_SECS      = 15.0   # longer silence → also clear writer identity (likely handoff)
-MIN_PEN_IDLE_FOR_OCR       = 0.5    # seconds of pen silence before OCR is processed
+PEN_WRITER_RESET_SECS      = 5.0    # longer silence → also clear writer identity (likely handoff)
+MIN_PEN_IDLE_FOR_OCR       = 2.0    # seconds since last pen motion before OCR is processed
 SOFT_REIDENTIFY_THRESHOLD  = 0.62   # before creating a new writer, soft-match against known prototypes
+PEN_MOTION_THRESHOLD       = 0.8    # motion_score above this = pen is actively moving
 
 
 class App(ctk.CTk):
@@ -990,6 +997,7 @@ class App(ctk.CTk):
         self._match_buffer: Deque[bool] = collections.deque(maxlen=MATCH_WINDOW)
         self._writer_stroke_counts: Dict[str, int] = {}
         self._last_stroke_time: float = 0.0
+        self._last_motion_time: float = 0.0
         self._ocr_attributions: List[dict] = []
         self._bulletin_labels: List[ctk.CTkFrame] = []
 
@@ -1297,6 +1305,8 @@ class App(ctk.CTk):
         try:
             while True:
                 sample = self._imu_queue.get_nowait()
+                if Segmenter.motion_score(sample) >= PEN_MOTION_THRESHOLD:
+                    self._last_motion_time = time.time()
                 seg    = self._segmenter.process_sample(sample)
                 if seg is not None:
                     self._on_segment(seg)
@@ -1307,14 +1317,12 @@ class App(ctk.CTk):
     def _on_segment(self, segment: np.ndarray) -> None:
         scores = [Segmenter.motion_score(s) for s in segment]
         motion_var = float(np.var(scores))
-        if motion_var < MIN_MOTION_VARIANCE:
-            return
-        if motion_var > MAX_MOTION_VARIANCE:
-            # Handoff shaking / accidental drop — don't touch the match buffer.
+        if motion_var < MIN_MOTION_VARIANCE or motion_var > MAX_MOTION_VARIANCE:
             return
 
         self._last_stroke_time = time.time()
 
+        # Manual enrollment overrides everything.
         if self._pending_enroll is not None:
             writer_id = self._pending_enroll
             self._writer_engine.enroll_segment(writer_id, segment, momentum=0.5)
@@ -1327,36 +1335,45 @@ class App(ctk.CTk):
             self._writer_label.configure(text=f"Enrolled: {writer_id}")
             return
 
-        # Enrollment phase: silently build up the prototype for ENROLL_STROKES
-        # strokes before comparison begins.  A single-stroke prototype is too
-        # fragile; intra-writer variance on the 2nd stroke would immediately
-        # trigger spurious new-writer creation.
-        current_enrolled = self._writer_stroke_counts.get(self._last_writer or "", 0)
-        if self._last_writer is not None and current_enrolled < ENROLL_STROKES:
-            writer_id = self._last_writer
-            if motion_var >= PROTOTYPE_UPDATE_VARIANCE:
-                self._writer_engine.enroll_segment(writer_id, segment, momentum=0.6)
-                self._writer_stroke_counts[writer_id] = current_enrolled + 1
-            score_str = f"building ({self._writer_stroke_counts.get(writer_id, 1)}/{ENROLL_STROKES})"
-            score = 0.0
-        else:
-            writer_id, score = self._writer_engine.predict_segment(segment)
+        score = 0.0
 
-            if writer_id is not None:
-                self._match_buffer.append(True)
-                if score >= 0.88 and motion_var >= PROTOTYPE_UPDATE_VARIANCE:
-                    self._writer_engine.enroll_segment(writer_id, segment, momentum=0.95)
-                score_str = f"{score:.2f}"
+        if self._last_writer is None:
+            # Fresh start after a long idle (handoff). Resolve identity immediately on
+            # the first stroke: soft-match against all known prototypes so a returning
+            # participant is recognised without needing to accumulate misses.
+            best_cand, best_cand_score = self._writer_engine.best_match_segment(segment)
+            if best_cand is not None and best_cand_score >= SOFT_REIDENTIFY_THRESHOLD:
+                writer_id = best_cand
+                self._writer_engine.enroll_segment(writer_id, segment, momentum=0.85)
+                score_str = f"re-id:{best_cand_score:.2f}"
             else:
-                self._match_buffer.append(False)
-                misses = self._match_buffer.count(False)
-                if misses >= BELOW_THRESH_STRIKES or self._last_writer is None:
-                    self._match_buffer.clear()
-                    if self._last_writer is not None:
-                        # Before creating a new writer, check whether a DIFFERENT known
-                        # prototype is a plausible soft match — handles returning participants.
-                        # Explicitly exclude _last_writer: failing against the current writer
-                        # and soft-matching back to them just means "similar style, new person."
+                self._auto_writer_count += 1
+                writer_id = f"Writer {self._auto_writer_count}"
+                self._writer_engine.enroll_segment(writer_id, segment, momentum=0.5)
+                self._writer_stroke_counts[writer_id] = 1
+                score_str = "new"
+            self._match_buffer.clear()
+        else:
+            current_enrolled = self._writer_stroke_counts.get(self._last_writer, 0)
+            if current_enrolled < ENROLL_STROKES:
+                # Silently build prototype before comparison begins.
+                writer_id = self._last_writer
+                if motion_var >= PROTOTYPE_UPDATE_VARIANCE:
+                    self._writer_engine.enroll_segment(writer_id, segment, momentum=0.6)
+                    self._writer_stroke_counts[writer_id] = current_enrolled + 1
+                score_str = f"building ({self._writer_stroke_counts.get(writer_id, 1)}/{ENROLL_STROKES})"
+            else:
+                writer_id, score = self._writer_engine.predict_segment(segment)
+                if writer_id is not None:
+                    self._match_buffer.append(True)
+                    if score >= 0.88 and motion_var >= PROTOTYPE_UPDATE_VARIANCE:
+                        self._writer_engine.enroll_segment(writer_id, segment, momentum=0.95)
+                    score_str = f"{score:.2f}"
+                else:
+                    self._match_buffer.append(False)
+                    if self._match_buffer.count(False) >= BELOW_THRESH_STRIKES:
+                        # Sliding-window fallback for short handoffs (<PEN_WRITER_RESET_SECS).
+                        self._match_buffer.clear()
                         best_cand, best_cand_score = self._writer_engine.best_match_segment(segment)
                         if (best_cand is not None and
                                 best_cand != self._last_writer and
@@ -1371,32 +1388,19 @@ class App(ctk.CTk):
                             self._writer_stroke_counts[writer_id] = 1
                             score_str = "new"
                     else:
-                        self._auto_writer_count += 1
-                        writer_id = f"Writer {self._auto_writer_count}"
-                        self._writer_engine.enroll_segment(writer_id, segment, momentum=0.5)
-                        self._writer_stroke_counts[writer_id] = 1
-                        score_str = "new"
-                else:
-                    writer_id = self._last_writer
-                    score_str = f"~{score:.2f}"
+                        writer_id = self._last_writer
+                        score_str = f"~{score:.2f}"
 
         self._last_writer = writer_id
-        self._bulletin.post(BulletinEvent(
-            kind="pen_segment",
-            writer_id=writer_id,
-            sim_score=score,
-        ))
-        color  = (self._whiteboard.get_writer_color(writer_id) if self._whiteboard
-                  else UNKNOWN_COLOR)
+        self._bulletin.post(BulletinEvent(kind="pen_segment", writer_id=writer_id, sim_score=score))
+        color = (self._whiteboard.get_writer_color(writer_id) if self._whiteboard else UNKNOWN_COLOR)
         ts_str = time.strftime("%H:%M:%S")
         self._add_bulletin_row(f"[{ts_str}] Pen: {writer_id} ({score_str})", color)
         self._writer_label.configure(text=f"Writer: {writer_id} ({score_str})")
 
-        # Short timer: clear only the match window (intra-word pauses).
         if self._pen_reset_timer is not None:
             self.after_cancel(self._pen_reset_timer)
         self._pen_reset_timer = self.after(int(PEN_RESET_SECS * 1000), self._on_pen_reset)
-        # Long timer: also clear writer identity (pen has been idle long enough to be a handoff).
         if self._writer_reset_timer is not None:
             self.after_cancel(self._writer_reset_timer)
         self._writer_reset_timer = self.after(int(PEN_WRITER_RESET_SECS * 1000), self._on_writer_reset)
@@ -1432,7 +1436,8 @@ class App(ctk.CTk):
                 latest = self._cv_queue.get_nowait()
         except queue.Empty:
             pass
-        if latest is not None and time.time() - self._last_stroke_time >= MIN_PEN_IDLE_FOR_OCR:
+        pen_idle = time.time() - max(self._last_stroke_time, self._last_motion_time)
+        if latest is not None and pen_idle >= MIN_PEN_IDLE_FOR_OCR:
             self._handle_cv_change(latest)
         self.after(50, self._cv_poll)
 

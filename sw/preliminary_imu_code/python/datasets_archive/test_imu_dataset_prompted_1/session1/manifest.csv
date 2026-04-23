@@ -1,6 +1,0 @@
-timestamp,session,label,speed,prompt_index,file_path,num_samples,start_count,end_count,drops_during_capture,measured_rate_hz
-2026-03-11 00:59:56,session1,X,normal,0,X\X_20260311_005956_0001.csv,80,62091,62170,0,51.9882
-2026-03-11 00:59:59,session1,H,normal,1,H\H_20260311_005959_0001.csv,57,62263,62319,0,52.1395
-2026-03-11 01:00:01,session1,1,normal,2,1\1_20260311_010001_0001.csv,47,62397,62443,0,51.9743
-2026-03-11 01:00:04,session1,S,normal,3,S\S_20260311_010004_0001.csv,42,62544,62585,0,52.0499
-2026-03-11 01:00:06,session1,i,normal,4,i\i_20260311_010006_0001.csv,34,62666,62699,0,51.8409
