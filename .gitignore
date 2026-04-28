@@ -5,7 +5,6 @@ sw/src/__pycache__
 # ML Ignores
 ml/datasets
 sw/ocr_imu/python/**/*.csv
-sw/preliminary_imu_code/*
 *.pt
 *.npy
 
